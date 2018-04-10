@@ -5,6 +5,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/ethernet.h>
+#include <linux/if_packet.h>
 
 #define BUFFLEN 100
 
@@ -36,14 +38,24 @@ struct _ip_header {
 	struct in_addr src, dst;
 };
 
+struct _mac_addr {
+	unsigned char addr[6];
+};
+
+struct _eth_header {
+	struct _mac_addr mac_dest;
+	struct _mac_addr mac_src;
+	unsigned short type;
+};
+
 unsigned int _crc16_ip(char *buf) {
 	unsigned int sum = 0;
 	unsigned short *word = (unsigned short *) buf;
 	for (int i = 0; i < 10; ++i, ++word) {
-		sum += word;
+		sum += *word;
 	}
 	sum = (sum & 0xFFFF) + (sum >> 16);
-	sum = (sum & 0xFFFF) + (sum >> 16);
+	sum += (sum >> 16);
 	sum = ~sum;
 	return sum;
 }
@@ -51,7 +63,7 @@ unsigned int _crc16_ip(char *buf) {
 void _udp_wrapper (char *buf, int offset, char *port, int msg_len) {
 	struct _udp_header *uh;
 	// udp header filling
-	uh = (struct _udp_header *)(buf + offset);
+	uh = (struct _udp_header *) (buf + offset);
 	// 7777 - for recognize this raw socket
 	uh->src_port = htons(7777);
 	uh->dest_port = htons(atoi(port));
@@ -61,63 +73,84 @@ void _udp_wrapper (char *buf, int offset, char *port, int msg_len) {
 	uh->chk_summ = 0;
 }
 
-void _ip_wrapper (char *buf, char *address, int all_len) {
+void _ip_wrapper (char *buf, int offset, char *address, int all_len) {
 	struct _ip_header *ih;
 	// ip header filling
-	ih = (struct _ip_header *) buf;
+	ih = (struct _ip_header *) (buf + offset);
 	ih->vhl = (4 << 4) | 5;
 	ih->tos = 0;
 	// 20 - ip header size, 14 - udp header size + payload size
 	ih->len = htons(20 + 14);
-	ih->id = 12345;
+	ih->id = htons(12345);
+	printf("ip id: %d\n", ih->id);
 	ih->ttl = 64;
 	ih->offset = 0;
 	// 17 - udp constant
 	ih->protocol = 17;
 	ih->checksum = 0;
-	ih->src.s_addr = inet_addr(address);
-	ih->dst.s_addr = inet_addr(address);
-	ih->checksum = htons(_crc16_ip(buf));
+	ih->src.s_addr = inet_addr("192.168.0.109");
+	ih->dst.s_addr = inet_addr("192.168.0.110");
+	ih->checksum = _crc16_ip(ih);
+}
+
+void _eth_wrapper (char *buf, struct _mac_addr dest, struct _mac_addr src) {
+	struct _eth_header *eh;
+	// eth header filling
+	eh = (struct _eth_header *) buf;
+	eh->mac_dest = dest;
+	eh->mac_src = src;
+	eh->type = htons(0x0800);
 }
 
 void _headers_print (char *buf) {
-	unsigned short *u_src = &buf[20];
-	unsigned short *u_dest = &buf[22];
-	unsigned short *u_len = &buf[24];
-	unsigned short *u_chk = &buf[26];
+	unsigned short *u_src = &buf[34];
+	unsigned short *u_dest = &buf[36];
+	unsigned short *u_len = &buf[38];
+	unsigned short *u_chk = &buf[40];
 	printf("udp header: %d %d %d %d\n", *u_src, *u_dest, ntohs(*u_len), *u_chk);
 }
 
 int main (int argc, char **argv) {
 	int raw_socket, length_addr;
-	struct sockaddr_in addr;
+	//struct sockaddr_in addr;
+	struct sockaddr_ll addr = {0};
+
+	struct _mac_addr dest = {{0x78, 0xdd, 0x08, 0xc3, 0x6e, 0xe5}};
+	struct _mac_addr src = {{0x44, 0x8a, 0x5b, 0x9a, 0xd8, 0x6b}};
 
 	printf("%s", "init net...");
-	if ((raw_socket = socket(AF_INET, SOCK_RAW, IPPROTO_UDP)) < 0) {
+	if ((raw_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) < 0) {
 		perror("[fail] - e1");
 		exit(1);
 	}
 
 	// enable user ip header
-	int val = 1;
-	setsockopt(raw_socket, IPPROTO_IP, IP_HDRINCL, &val, sizeof(val));
+	// int val = 1;
+	// setsockopt(raw_socket, IPPROTO_IP, IP_HDRINCL, &val, sizeof(val));
 
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = inet_addr(argv[1]);
-	addr.sin_port = htons(atoi(argv[2]));
+	// addr.sin_family = AF_INET;
+	// addr.sin_addr.s_addr = inet_addr(argv[1]);
+	// addr.sin_port = htons(atoi(argv[2]));
+
+	addr.sll_family = AF_PACKET;
+	addr.sll_ifindex = if_nametoindex("enp3s0");
+	addr.sll_halen = 6;
+	memcpy(addr.sll_addr, &dest, 6);
 	printf("%s\n", "[done]");
 
 	char *buf = malloc(BUFFLEN);
 	bzero(buf, BUFFLEN);
 
-	_udp_wrapper(buf, 20, argv[2], sizeof("hello"));
-	_ip_wrapper(buf, argv[1], sizeof("hello") + 8);
+	_udp_wrapper(buf, 34, argv[2], sizeof("hello"));
+	_ip_wrapper(buf, 14, argv[1], sizeof("hello") + 8);
+	_eth_wrapper(buf, dest, src);
 	_headers_print(buf);
-	strncat(buf + 28, "hello", 5);
+
+	strncat(buf + 42, "hello", 5);
 
 	printf("%s", "send packet...");
-	if (sendto(raw_socket, buf, sizeof("hello") + 28,
-	 NULL, &addr, sizeof(addr)) <= 0) {
+	if (sendto(raw_socket, buf, sizeof("hello") + 14 + 20 + 8,
+	 NULL, (struct sockaddr_ll *) &addr, sizeof(addr)) <= 0) {
 		perror("[fail] - e2");
 		exit(1);
 	}
@@ -134,11 +167,11 @@ int main (int argc, char **argv) {
 			perror("[fail] - e3");
 			exit(1);
 		}
-		uh = (struct _udp_header *) (buf + 20);
+		uh = (struct _udp_header *) (buf + 34);
 		printf("udp header: %d %d %d %d %s\n", uh->src_port, uh->dest_port, ntohs(uh->len), uh->chk_summ, buf + 28);
 	} while (uh->dest_port != right_dest);
 	printf("%s\n", "[done]");
-	printf("answer: %s\n", buf + 28);
+	printf("answer: %s\n", buf + 42);
 	free(buf);
 	close(raw_socket);
 }
